@@ -60,15 +60,15 @@ python3 aws_probe.py --list-services
 
 ## Example
 
-![Screenshot 1](screenshots/Screenshot_2026-09-22_212559.png)
+![Screenshot 1](screenshots/Screenshot_2026-09-23_235858.png)
 
-![Screenshot 2](screenshots/Screenshot_2026-09-22_212639.png)
+![Screenshot 2](screenshots/Screenshot_2026-09-23_235930.png)
 
-![Screenshot 3](screenshots/Screenshot_2026-09-22_212748.png)
+![Screenshot 3](screenshots/Screenshot_2026-09-23_235952.png)
 
-![Screenshot 4](screenshots/Screenshot_2026-09-22_212828.png)
+![Screenshot 4](screenshots/Screenshot_2026-09-24_000011.png)
 
-![Screenshot 5](screenshots/Screenshot_2026-09-22_212845.png)
+![Screenshot 5](screenshots/Screenshot_2026-09-24_000031.png)
 
 ## What it does
 
