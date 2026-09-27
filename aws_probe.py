@@ -245,6 +245,8 @@ SERVICE_CHECKS = [
          kwargs={"RoleName": "__awsrecon_probe__"}, label="IAM ListRolePolicies [READ PROBE]"),
     dict(service="iam", client="iam", method="get_role", key=None, global_svc=True, probe=True,
          kwargs={"RoleName": "__awsrecon_probe__"}, label="IAM GetRole [READ PROBE]"),
+    dict(service="iam", client="iam", method="get_role_policy", key=None, global_svc=True, probe=True,
+         kwargs={"RoleName": "__awsrecon_probe__", "PolicyName": "__awsrecon_probe__"}, label="IAM GetRolePolicy [READ PROBE]"),
 
     # -- IAM: write probes --
     dict(service="iam", client="iam", method="create_user", probe=True, write=True, global_svc=True,
