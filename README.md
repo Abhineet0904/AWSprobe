@@ -37,22 +37,22 @@ pip install -r requirements.txt --break-system-packages   # Kali/Debian needs th
 
 ```bash
 # Basic scan, current default region for the profile
-python3 aws_probe.py --profile ABC
+python3 aws_probe.py --profile [profile_name]
 
 # Scan every enabled region (needs ec2:DescribeRegions, else falls back)
-python3 aws_probe.py --profile ABC --all-regions
+python3 aws_probe.py --profile [profile_name] --all-regions
 
 # Specific regions only
-python3 aws_probe.py --profile ABC --region us-east-1 --region eu-west-1
+python3 aws_probe.py --profile [profile_name] --region us-east-1 --region eu-west-1
 
 # Limit to specific services
-python3 aws_probe.py --profile ABC --services s3,iam,lambda,ec2
+python3 aws_probe.py --profile [profile_name] --services s3,iam,lambda,ec2
 
 # Show every resource found (default truncates to 5 per check)
-python3 aws_probe.py --profile ABC --full
+python3 aws_probe.py --profile [profile_name] --full
 
 # Save full machine-readable output too
-python3 aws_probe.py --profile ABC --json report.json
+python3 aws_probe.py --profile [profile_name] --json report.json
 
 # List all supported services
 python3 aws_probe.py --list-services
