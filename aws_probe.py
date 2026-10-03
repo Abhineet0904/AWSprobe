@@ -57,19 +57,20 @@ class C:
 ARN_KEYS = [
     "Arn", "ARN", "arn", "TopicArn", "QueueArn", "FunctionArn", "RoleArn",
     "PolicyArn", "TableArn", "StreamArn", "ClusterArn", "ServiceArn",
-    "DBInstanceArn", "LoadBalancerArn", "CertificateArn", "KeyArn",
+    "DBInstanceArn", "DBSnapshotArn", "DBClusterSnapshotArn", "LoadBalancerArn", "CertificateArn", "KeyArn",
     "SecretArn", "RepositoryArn", "StateMachineArn", "TrailARN",
     "DomainArn", "PipelineArn", "ProjectArn",
 ]
 NAME_KEYS = [
     "Name", "name", "FunctionName", "TableName", "BucketName", "GroupName",
-    "UserName", "RoleName", "PolicyName", "DBInstanceIdentifier",
+    "UserName", "RoleName", "PolicyName", "DBSnapshotIdentifier", "DBInstanceIdentifier",
     "ClusterName", "ClusterIdentifier", "QueueUrl", "TopicArn", "KeyId",
     "SecretId", "StackName", "DomainName", "Id", "InstanceId", "VpcId",
     "GroupId", "VolumeId", "SnapshotId", "RepositoryName",
     "RestApiId", "PipelineName", "ProjectName", "DeliveryStreamName",
     "CacheClusterId", "FileSystemId", "DetectorId", "NotebookInstanceName",
     "WebACLId", "BackupVaultName", "ServerId", "StateMachineArn", "Permission",
+    "Key",
 ]
 
 
@@ -433,6 +434,86 @@ def get_regions(session, requested):
         return ALL_AWS_REGIONS
 
 
+def run_dependent_check(session, client_name, method_name, kwargs, key=None, global_svc=True, region=None):
+    """
+    Like run_check, but for a call bound to a real resource ID discovered
+    in an earlier phase (e.g. ecs:ListTasks against a real cluster ARN,
+    instead of a dummy placeholder). Returns (status, count, items, err).
+    """
+    try:
+        region_kw = {} if global_svc else {"region_name": region}
+        client = session.client(client_name, **region_kw)
+        method = getattr(client, method_name)
+        resp = method(**kwargs)
+        items = [resp] if key is None else resp.get(key, [])
+        norm = [{"Name": it} if isinstance(it, str) else it for it in items]
+        return "accessible", len(norm), norm, None
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException", "UnauthorizedOperation", "UnauthorizedException", "AuthorizationError"):
+            return "denied", 0, [], code
+        return "error", 0, [], f"{code}: {e.response.get('Error', {}).get('Message', '')}"
+    except Exception as e:
+        return "error", 0, [], str(e)
+
+
+def list_bucket_objects(session, bucket, max_keys=1000):
+    """
+    s3:ListObjectsV2 against one specific real bucket -- the 'aws s3 ls
+    s3://bucket/' equivalent. Tries the bucket's own region first (a
+    bucket in a different region than the client throws a redirect error
+    that boto3 resolves automatically on the next call in most cases, but
+    we pin the region explicitly to avoid a second round trip).
+    Returns (status, count, items, err) matching run_check's shape.
+    """
+    try:
+        client = session.client("s3")
+        keys = []
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, PaginationConfig={"MaxItems": max_keys}):
+            for obj in page.get("Contents", []):
+                keys.append({
+                    "Key": obj["Key"],
+                    "Size": obj.get("Size"),
+                    "LastModified": obj.get("LastModified"),
+                    "Bucket": bucket,
+                })
+        return "accessible", len(keys), keys, None
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        if code in ("AccessDenied", "AccessDeniedException"):
+            return "denied", 0, [], code
+        return "error", 0, [], f"{code}: {e.response.get('Error', {}).get('Message', '')}"
+    except Exception as e:
+        return "error", 0, [], str(e)
+
+
+def download_bucket_object(session, bucket, key, dest_dir, max_bytes):
+    """
+    s3:GetObject for one object -- the 'aws s3 cp' equivalent. Skips
+    objects over max_bytes rather than silently pulling down huge files.
+    Returns (status, path_or_None, err).
+    """
+    import os
+
+    try:
+        client = session.client("s3")
+        head = client.head_object(Bucket=bucket, Key=key)
+        size = head.get("ContentLength", 0)
+        if max_bytes and size > max_bytes:
+            return "skipped", None, f"{size} bytes exceeds --max-download-size limit"
+
+        local_path = os.path.join(dest_dir, bucket, key)
+        os.makedirs(os.path.dirname(local_path) or dest_dir, exist_ok=True)
+        client.download_file(bucket, key, local_path)
+        return "downloaded", local_path, None
+    except ClientError as e:
+        code = e.response.get("Error", {}).get("Code", "")
+        return "error", None, code
+    except Exception as e:
+        return "error", None, str(e)
+
+
 def run_check(session, check, region):
     """Execute a single service check, return (status, count, items, err)."""
     client_name = check["client"]
@@ -526,6 +607,11 @@ def main():
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colors.")
     ap.add_argument("--quiet-denied", action="store_true", help="Hide the denied-services summary line.")
     ap.add_argument("--list-services", action="store_true", help="List all service check keys this tool knows about, then exit.")
+    ap.add_argument("--no-list-objects", action="store_true", help="Skip s3:ListObjectsV2 on every accessible bucket (equivalent to 'aws s3 ls s3://bucket/'). Listing is on by default when s3 is in scope.")
+    ap.add_argument("--object-limit", type=int, default=1000, help="Max objects to list per bucket (default: 1000).")
+    ap.add_argument("--download-dir", metavar="DIR", help="Download every listed object into DIR/<bucket>/<key> (equivalent to 'aws s3 cp'). Off by default -- this performs real GetObject calls and writes real data to disk.")
+    ap.add_argument("--max-download-size", type=int, default=50, help="Skip downloading objects larger than this many MB (default: 50). Ignored if --download-dir is not set.")
+    ap.add_argument("--read-secrets", action="store_true", help="Call secretsmanager:GetSecretValue on every secret found by list_secrets. Off by default -- this retrieves real secret material, not just metadata.")
     args = ap.parse_args()
 
     if args.no_color or not sys.stdout.isatty():
@@ -570,7 +656,7 @@ def main():
 
     regions = get_regions(session, args.region) if args.all_regions or args.region else [session.region_name or "us-east-1"]
     print(f"{C.B}[*] Regions in scope: {', '.join(regions)}{C.END}")
-    print(f"{C.B}[*] Running {len(checks)} service checks x {len(regions)} region(s)...{C.END}\n")
+    print(f"{C.B}[*] Running {len(checks)} initial service checks x {len(regions)} region(s)...{C.END}\n")
 
     jobs = []
     for check in checks:
@@ -596,6 +682,146 @@ def main():
                 method=check["method"], region=region, status=status,
                 count=count, items=items, error=err,
             ))
+
+    # --- Phase 2: per-bucket object listing (+ optional download) ---
+    # list_buckets only tells you bucket *names* exist ("aws s3 ls" with no
+    # path). Actually seeing what's inside each bucket needs a separate
+    # s3:ListObjectsV2 call per bucket, since the bucket names aren't known
+    # until phase 1 finishes -- this can't be a static SERVICE_CHECKS entry.
+    if (not wanted or "s3" in wanted) and not args.no_list_objects:
+        bucket_names = []
+        for r in results:
+            if r["service"] == "s3" and r["method"] == "list_buckets" and r["status"] == "accessible":
+                bucket_names = [b.get("Name") for b in r["items"] if b.get("Name")]
+
+        if bucket_names:
+            print(f"{C.B}[*] Listing objects in {len(bucket_names)} accessible bucket(s)...{C.END}")
+
+            def obj_worker(bucket):
+                status, count, items, err = list_bucket_objects(session, bucket, args.object_limit)
+                return bucket, status, count, items, err
+
+            all_listed_objects = []  # (bucket, key) pairs for phase 3 download
+            with ThreadPoolExecutor(max_workers=args.threads) as ex:
+                futures = [ex.submit(obj_worker, b) for b in bucket_names]
+                for fut in as_completed(futures):
+                    bucket, status, count, items, err = fut.result()
+                    results.append(dict(
+                        service="s3", label=f"s3:ListObjectsV2 [{bucket}]",
+                        method="list_objects_v2", region=None, status=status,
+                        count=count, items=items, error=err,
+                    ))
+                    if status == "accessible":
+                        for it in items:
+                            all_listed_objects.append((bucket, it["Key"], it.get("Size") or 0))
+
+            # --- Phase 3: optional download (off by default -- real data access, not just enumeration) ---
+            if args.download_dir and all_listed_objects:
+                max_bytes = args.max_download_size * 1024 * 1024 if args.max_download_size else None
+                print(f"{C.B}[*] Downloading {len(all_listed_objects)} object(s) to {args.download_dir}/ "
+                      f"(skipping any over {args.max_download_size} MB)...{C.END}")
+
+                def dl_worker(bucket, key):
+                    status, path, err = download_bucket_object(session, bucket, key, args.download_dir, max_bytes)
+                    return bucket, key, status, path, err
+
+                downloaded, skipped, dl_errors = 0, 0, 0
+                with ThreadPoolExecutor(max_workers=args.threads) as ex:
+                    futures = [ex.submit(dl_worker, b, k) for b, k, _ in all_listed_objects]
+                    for fut in as_completed(futures):
+                        bucket, key, status, path, err = fut.result()
+                        if status == "downloaded":
+                            downloaded += 1
+                            print(f"{C.G}    [+] {bucket}/{key} -> {path}{C.END}")
+                        elif status == "skipped":
+                            skipped += 1
+                            print(f"{C.Y}    [~] {bucket}/{key} skipped ({err}){C.END}")
+                        else:
+                            dl_errors += 1
+                            print(f"{C.R}    [-] {bucket}/{key} failed ({err}){C.END}")
+
+                print(f"{C.BOLD}[*] Download summary: {downloaded} downloaded, {skipped} skipped, {dl_errors} failed.{C.END}\n")
+
+    # --- Phase 2b: dependent read checks against real discovered resource names ---
+    # Mirrors the S3 pattern above: several services only reveal useful detail
+    # once you already know a real resource name/ARN from an earlier check
+    # (e.g. ecs:ListTasks needs a real cluster ARN, not a dummy placeholder).
+    # The static [READ PROBE]/[WRITE PROBE] entries in SERVICE_CHECKS still run
+    # regardless (they answer "do I have this permission at all", even against
+    # zero real resources) -- these jobs are additive real enumeration.
+    dep_jobs = []  # (service, label, client, method, kwargs, key, global_svc, region)
+
+    def real_names(service, method, field="Name", region_filter=None):
+        out = []
+        for r in results:
+            if r["service"] == service and r["method"] == method and r["status"] == "accessible":
+                for it in r["items"]:
+                    val = it.get(field)
+                    if val:
+                        out.append((val, r["region"]))
+        return out
+
+    for cluster_arn, region in real_names("ecs", "list_clusters"):
+        short = cluster_arn.split("/")[-1]
+        for method, key in (("list_tasks", "taskArns"), ("list_services", "serviceArns"), ("list_container_instances", "containerInstanceArns")):
+            dep_jobs.append(("ecs", f"ecs:{method} [{short}]", "ecs", method, {"cluster": cluster_arn}, key, False, region))
+
+    for role_name, _ in real_names("iam", "list_roles", field="RoleName"):
+        dep_jobs.append(("iam", f"iam:ListAttachedRolePolicies [{role_name}]", "iam", "list_attached_role_policies", {"RoleName": role_name}, "AttachedPolicies", True, None))
+        dep_jobs.append(("iam", f"iam:ListRolePolicies [{role_name}]", "iam", "list_role_policies", {"RoleName": role_name}, "PolicyNames", True, None))
+        dep_jobs.append(("iam", f"iam:GetRole [{role_name}]", "iam", "get_role", {"RoleName": role_name}, None, True, None))
+
+    for user_name, _ in real_names("iam", "list_users", field="UserName"):
+        dep_jobs.append(("iam", f"iam:ListAttachedUserPolicies [{user_name}]", "iam", "list_attached_user_policies", {"UserName": user_name}, "AttachedPolicies", True, None))
+
+    for func_name, region in real_names("lambda", "list_functions", field="FunctionName"):
+        dep_jobs.append(("lambda", f"lambda:ListAliases [{func_name}]", "lambda", "list_aliases", {"FunctionName": func_name}, "Aliases", False, region))
+
+    for cluster_name, region in real_names("eks", "list_clusters", field="Name"):
+        dep_jobs.append(("eks", f"eks:DescribeCluster [{cluster_name}]", "eks", "describe_cluster", {"name": cluster_name}, None, False, region))
+
+    if args.read_secrets:
+        for secret_id, region in real_names("secretsmanager", "list_secrets", field="ARN"):
+            dep_jobs.append(("secretsmanager", f"secretsmanager:GetSecretValue [{secret_id.split(':')[-1]}]", "secretsmanager", "get_secret_value", {"SecretId": secret_id}, None, False, region))
+
+    if dep_jobs:
+        print(f"{C.B}[*] Running {len(dep_jobs)} dependent check(s) against real discovered resources...{C.END}")
+
+        def dep_worker(job):
+            service, label, client_name, method, kwargs, key, global_svc, region = job
+            status, count, items, err = run_dependent_check(session, client_name, method, kwargs, key=key, global_svc=global_svc, region=region)
+            return service, label, method, region, status, count, items, err
+
+        # keep list_role_policies results around so we can chase real PolicyNames -> get_role_policy
+        role_policy_lookup = {}  # role_name -> [policy_name, ...]
+
+        with ThreadPoolExecutor(max_workers=args.threads) as ex:
+            futures = [ex.submit(dep_worker, j) for j in dep_jobs]
+            for fut in as_completed(futures):
+                service, label, method, region, status, count, items, err = fut.result()
+                results.append(dict(service=service, label=label, method=method, region=region, status=status, count=count, items=items, error=err))
+                if method == "list_role_policies" and status == "accessible" and count > 0:
+                    role_name = label.split("[")[-1].rstrip("]")
+                    role_policy_lookup[role_name] = [it.get("Name") for it in items if it.get("Name")]
+
+        # --- Phase 2c: get_role_policy for every real (role, inline-policy-name) pair found above ---
+        policy_jobs = [(role, pol) for role, pols in role_policy_lookup.items() for pol in pols]
+        if policy_jobs:
+            print(f"{C.B}[*] Reading {len(policy_jobs)} inline role polic{'y' if len(policy_jobs) == 1 else 'ies'}...{C.END}")
+
+            def policy_worker(role, pol):
+                status, count, items, err = run_dependent_check(
+                    session, "iam", "get_role_policy", {"RoleName": role, "PolicyName": pol}, key=None, global_svc=True)
+                return role, pol, status, count, items, err
+
+            with ThreadPoolExecutor(max_workers=args.threads) as ex:
+                futures = [ex.submit(policy_worker, r, p) for r, p in policy_jobs]
+                for fut in as_completed(futures):
+                    role, pol, status, count, items, err = fut.result()
+                    results.append(dict(
+                        service="iam", label=f"iam:GetRolePolicy [{role}/{pol}]", method="get_role_policy",
+                        region=None, status=status, count=count, items=items, error=err,
+                    ))
 
     # --- Report ---
     accessible = [r for r in results if r["status"] == "accessible" and r["count"] > 0]
