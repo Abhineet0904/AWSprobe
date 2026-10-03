@@ -62,7 +62,7 @@ ARN_KEYS = [
     "DomainArn", "PipelineArn", "ProjectArn",
 ]
 NAME_KEYS = [
-    "Name", "name", "FunctionName", "TableName", "BucketName", "GroupName",
+    "PolicyActions", "Name", "name", "FunctionName", "TableName", "BucketName", "GroupName",
     "UserName", "RoleName", "PolicyName", "DBSnapshotIdentifier", "DBInstanceIdentifier",
     "ClusterName", "ClusterIdentifier", "QueueUrl", "TopicArn", "KeyId",
     "SecretId", "StackName", "DomainName", "Id", "InstanceId", "VpcId",
@@ -79,6 +79,33 @@ def first_present(d, keys):
         if isinstance(d, dict) and d.get(k):
             return d[k]
     return None
+
+
+def summarize_policy_actions(policy_document):
+    """
+    Flatten an inline/managed policy document's Statement(s) into a single
+    deduplicated, readable string of Actions -- e.g. 'iam:PassRole, glue:CreateJob,
+    glue:StartJobRun'. Returns None if the document doesn't look like a policy.
+    Used to surface GetRolePolicy/GetUserPolicy results in the console table
+    instead of them just re-printing the parent user/role name.
+    """
+    if not isinstance(policy_document, dict):
+        return None
+    stmts = policy_document.get("Statement")
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    if not isinstance(stmts, list):
+        return None
+    seen = []
+    for s in stmts:
+        if not isinstance(s, dict):
+            continue
+        action = s.get("Action")
+        values = [action] if isinstance(action, str) else action if isinstance(action, list) else []
+        for a in values:
+            if a not in seen:
+                seen.append(a)
+    return ", ".join(seen) if seen else None
 
 
 def extract_identity(item):
@@ -240,6 +267,10 @@ SERVICE_CHECKS = [
     # -- IAM: additional reads --
     dict(service="iam", client="iam", method="list_attached_user_policies", key="AttachedPolicies", global_svc=True, paginate=True, probe=True,
          kwargs={"UserName": "__awsrecon_probe__"}, label="IAM ListAttachedUserPolicies [READ PROBE]"),
+    dict(service="iam", client="iam", method="list_user_policies", key="PolicyNames", global_svc=True, paginate=True, probe=True,
+         kwargs={"UserName": "__awsrecon_probe__"}, label="IAM ListUserPolicies [READ PROBE]"),
+    dict(service="iam", client="iam", method="get_user_policy", key=None, global_svc=True, probe=True,
+         kwargs={"UserName": "__awsrecon_probe__", "PolicyName": "__awsrecon_probe__"}, label="IAM GetUserPolicy [READ PROBE]"),
     dict(service="iam", client="iam", method="list_attached_role_policies", key="AttachedPolicies", global_svc=True, paginate=True, probe=True,
          kwargs={"RoleName": "__awsrecon_probe__"}, label="IAM ListAttachedRolePolicies [READ PROBE]"),
     dict(service="iam", client="iam", method="list_role_policies", key="PolicyNames", global_svc=True, paginate=True, probe=True,
@@ -773,6 +804,7 @@ def main():
 
     for user_name, _ in real_names("iam", "list_users", field="UserName"):
         dep_jobs.append(("iam", f"iam:ListAttachedUserPolicies [{user_name}]", "iam", "list_attached_user_policies", {"UserName": user_name}, "AttachedPolicies", True, None))
+        dep_jobs.append(("iam", f"iam:ListUserPolicies [{user_name}]", "iam", "list_user_policies", {"UserName": user_name}, "PolicyNames", True, None))
 
     for func_name, region in real_names("lambda", "list_functions", field="FunctionName"):
         dep_jobs.append(("lambda", f"lambda:ListAliases [{func_name}]", "lambda", "list_aliases", {"FunctionName": func_name}, "Aliases", False, region))
@@ -792,8 +824,10 @@ def main():
             status, count, items, err = run_dependent_check(session, client_name, method, kwargs, key=key, global_svc=global_svc, region=region)
             return service, label, method, region, status, count, items, err
 
-        # keep list_role_policies results around so we can chase real PolicyNames -> get_role_policy
+        # keep list_role_policies / list_user_policies results around so we can
+        # chase real PolicyNames -> get_role_policy / get_user_policy
         role_policy_lookup = {}  # role_name -> [policy_name, ...]
+        user_policy_lookup = {}  # user_name -> [policy_name, ...]
 
         with ThreadPoolExecutor(max_workers=args.threads) as ex:
             futures = [ex.submit(dep_worker, j) for j in dep_jobs]
@@ -803,6 +837,9 @@ def main():
                 if method == "list_role_policies" and status == "accessible" and count > 0:
                     role_name = label.split("[")[-1].rstrip("]")
                     role_policy_lookup[role_name] = [it.get("Name") for it in items if it.get("Name")]
+                if method == "list_user_policies" and status == "accessible" and count > 0:
+                    user_name = label.split("[")[-1].rstrip("]")
+                    user_policy_lookup[user_name] = [it.get("Name") for it in items if it.get("Name")]
 
         # --- Phase 2c: get_role_policy for every real (role, inline-policy-name) pair found above ---
         policy_jobs = [(role, pol) for role, pols in role_policy_lookup.items() for pol in pols]
@@ -818,8 +855,35 @@ def main():
                 futures = [ex.submit(policy_worker, r, p) for r, p in policy_jobs]
                 for fut in as_completed(futures):
                     role, pol, status, count, items, err = fut.result()
+                    if status == "accessible" and items and isinstance(items[0], dict) and "PolicyDocument" in items[0]:
+                        actions = summarize_policy_actions(items[0]["PolicyDocument"])
+                        if actions:
+                            items[0]["PolicyActions"] = f"[{pol}] {actions}"
                     results.append(dict(
                         service="iam", label=f"iam:GetRolePolicy [{role}/{pol}]", method="get_role_policy",
+                        region=None, status=status, count=count, items=items, error=err,
+                    ))
+
+        # --- Phase 2d: get_user_policy for every real (user, inline-policy-name) pair found above ---
+        user_policy_jobs = [(user, pol) for user, pols in user_policy_lookup.items() for pol in pols]
+        if user_policy_jobs:
+            print(f"{C.B}[*] Reading {len(user_policy_jobs)} inline user polic{'y' if len(user_policy_jobs) == 1 else 'ies'}...{C.END}")
+
+            def user_policy_worker(user, pol):
+                status, count, items, err = run_dependent_check(
+                    session, "iam", "get_user_policy", {"UserName": user, "PolicyName": pol}, key=None, global_svc=True)
+                return user, pol, status, count, items, err
+
+            with ThreadPoolExecutor(max_workers=args.threads) as ex:
+                futures = [ex.submit(user_policy_worker, u, p) for u, p in user_policy_jobs]
+                for fut in as_completed(futures):
+                    user, pol, status, count, items, err = fut.result()
+                    if status == "accessible" and items and isinstance(items[0], dict) and "PolicyDocument" in items[0]:
+                        actions = summarize_policy_actions(items[0]["PolicyDocument"])
+                        if actions:
+                            items[0]["PolicyActions"] = f"[{pol}] {actions}"
+                    results.append(dict(
+                        service="iam", label=f"iam:GetUserPolicy [{user}/{pol}]", method="get_user_policy",
                         region=None, status=status, count=count, items=items, error=err,
                     ))
 
