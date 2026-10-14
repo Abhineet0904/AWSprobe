@@ -817,7 +817,7 @@ def main():
             dep_jobs.append(("secretsmanager", f"secretsmanager:GetSecretValue [{secret_id.split(':')[-1]}]", "secretsmanager", "get_secret_value", {"SecretId": secret_id}, None, False, region))
 
     if dep_jobs:
-        print(f"{C.B}[*] Running {len(dep_jobs)} dependent check(s) against real discovered resources...{C.END}")
+        print(f"{C.B}[*] Adding {len(dep_jobs)} dependent check(s) against real discovered resources...{C.END}")
 
         def dep_worker(job):
             service, label, client_name, method, kwargs, key, global_svc, region = job
